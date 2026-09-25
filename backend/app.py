@@ -42,6 +42,13 @@ class BatchIn(BaseModel):
     steps: list[StepIn]
 
 
+class MinutesIn(BaseModel):
+    minutes: float = Field(ge=0, le=10000)
+
+
+DEFAULT_OBSERVE_MINUTES = 30.0
+
+
 def current_user(credentials: HTTPAuthorizationCredentials | None = Depends(security)) -> dict:
     if credentials is None:
         raise HTTPException(status_code=401, detail="未登录")
@@ -74,8 +81,23 @@ def startup():
                 verdict text NOT NULL,
                 reason text NOT NULL,
                 created_by text NOT NULL,
-                created_at timestamptz NOT NULL
+                created_at timestamptz NOT NULL,
+                observe_completed_at timestamptz
             )"""
+        )
+        conn.execute(
+            "ALTER TABLE batches ADD COLUMN IF NOT EXISTS observe_completed_at timestamptz"
+        )
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS settings (
+                key text PRIMARY KEY,
+                value double precision NOT NULL
+            )"""
+        )
+        conn.execute(
+            "INSERT INTO settings (key, value) VALUES ('observe_minutes', %s) "
+            "ON CONFLICT (key) DO NOTHING",
+            (DEFAULT_OBSERVE_MINUTES,),
         )
         count = conn.execute("SELECT COUNT(*) AS n FROM batches").fetchone()["n"]
         if count == 0:
@@ -129,3 +151,75 @@ def create_batch(body: BatchIn, user: dict = Depends(require_writer)):
         ).fetchone()
         conn.commit()
     return row
+
+
+def _observe_minutes(conn) -> float:
+    row = conn.execute("SELECT value FROM settings WHERE key = 'observe_minutes'").fetchone()
+    return float(row["value"]) if row else DEFAULT_OBSERVE_MINUTES
+
+
+def _serialize_observation(row: dict, minutes: float) -> dict:
+    due_at = row["created_at"] + timedelta(minutes=minutes)
+    return {
+        "id": row["id"],
+        "herb": row["herb"],
+        "verdict": row["verdict"],
+        "reason": row["reason"],
+        "created_by": row["created_by"],
+        "created_at": row["created_at"].isoformat(),
+        "observe_minutes": minutes,
+        "due_at": due_at.isoformat(),
+        "observe_completed_at": row["observe_completed_at"].isoformat() if row["observe_completed_at"] else None,
+    }
+
+
+@app.get("/api/observation")
+def observation_book(_user: dict = Depends(current_user)):
+    with connect() as conn:
+        minutes = _observe_minutes(conn)
+        rows = conn.execute(
+            """SELECT id, herb, verdict, reason, created_by, created_at, observe_completed_at
+               FROM batches ORDER BY id DESC"""
+        ).fetchall()
+    observing = [_serialize_observation(r, minutes) for r in rows if r["observe_completed_at"] is None]
+    completed = [_serialize_observation(r, minutes) for r in rows if r["observe_completed_at"] is not None]
+    return {"minutes": minutes, "observing": observing, "completed": completed}
+
+
+@app.put("/api/observation/minutes")
+def set_observe_minutes(body: MinutesIn, user: dict = Depends(require_writer)):
+    with connect() as conn:
+        conn.execute(
+            """INSERT INTO settings (key, value) VALUES ('observe_minutes', %s)
+               ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value""",
+            (body.minutes,),
+        )
+        conn.commit()
+    return {"minutes": body.minutes}
+
+
+@app.post("/api/observation/{batch_id}/complete")
+def complete_observation(batch_id: int, user: dict = Depends(require_writer)):
+    now = datetime.now(timezone.utc)
+    with connect() as conn:
+        minutes = _observe_minutes(conn)
+        row = conn.execute(
+            "SELECT id, created_at, observe_completed_at FROM batches WHERE id = %s",
+            (batch_id,),
+        ).fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="记录不存在")
+        if row["observe_completed_at"] is not None:
+            raise HTTPException(status_code=409, detail="该行已完成观察")
+        created_at = row["created_at"]
+        if created_at.tzinfo is None:
+            created_at = created_at.replace(tzinfo=timezone.utc)
+        if now < created_at + timedelta(minutes=minutes):
+            raise HTTPException(status_code=409, detail=f"未满观察分钟（{minutes:g} 分钟），禁止完成观察")
+        updated = conn.execute(
+            "UPDATE batches SET observe_completed_at = %s WHERE id = %s "
+            "RETURNING observe_completed_at",
+            (now, batch_id),
+        ).fetchone()
+        conn.commit()
+    return {"id": batch_id, "observe_completed_at": updated["observe_completed_at"].isoformat()}
